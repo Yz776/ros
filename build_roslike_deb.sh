@@ -1,37 +1,33 @@
 #!/bin/bash
 set -e
 
-PKGNAME="roslike"
-VERSION="1.0"
-ARCH="all"
-WORKDIR="$(pwd)/${PKGNAME}_${VERSION}"
+PKG="roslike"
+VER="1.0-1"
+WORKDIR="$(pwd)/${PKG}_${VER}"
 
-# Bersihkan build lama
-rm -rf "$WORKDIR" "${PKGNAME}_${VERSION}-1.deb"
+echo ">> Membuat struktur paket $PKG"
+
+rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR/DEBIAN"
 mkdir -p "$WORKDIR/usr/bin"
-mkdir -p "$WORKDIR/etc/systemd/system"
+mkdir -p "$WORKDIR/lib/systemd/system"
 mkdir -p "$WORKDIR/etc/init.d"
-mkdir -p "$WORKDIR/var/log/roslike"
-mkdir -p "$WORKDIR/etc/roslike/config"
+mkdir -p "$WORKDIR/etc/profile.d"
 
-# =========================
-# Control File
-# =========================
+# --- control file ---
 cat > "$WORKDIR/DEBIAN/control" <<EOF
-Package: $PKGNAME
-Version: $VERSION-1
+Package: $PKG
+Version: $VER
 Section: net
 Priority: optional
-Architecture: $ARCH
-Depends: bash, iproute2, iptables, dnsmasq, hostapd, ppp, pptpd, python3, python3-flask
+Architecture: all
+Depends: python3-flask, iproute2, hostapd, dnsmasq, ppp, pptpd, mariadb-server
 Maintainer: Admin <admin@example.com>
-Description: RouterOS-like system for Debian/Ubuntu
+Description: RouterOS-like system (roslike)
+ A Debian package that provides a RouterOS-like CLI and WebUI.
 EOF
 
-# =========================
-# Postinst (setup awal)
-# =========================
+# --- postinst ---
 cat > "$WORKDIR/DEBIAN/postinst" <<'EOF'
 #!/bin/bash
 set -e
@@ -44,6 +40,7 @@ mkdir -p /var/log/roslike
 if [ ! -f /etc/roslike/config/.initialized ]; then
     echo ""
     echo "=== RouterOS-like Initial Setup ==="
+
     echo "Daftar interface tersedia:"
     ip -o link show | awk -F': ' '{print NR ") " $2}'
 
@@ -64,63 +61,30 @@ CFG
     echo ">> Setup awal selesai"
 fi
 
-# Aktifkan WebUI
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload
-    systemctl enable roslike-webui || true
-    systemctl restart roslike-webui || true
+# Buat user rosadmin kalau belum ada
+if ! id "rosadmin" &>/dev/null; then
+    useradd -m -s /usr/bin/roslike rosadmin || true
+    echo "rosadmin:roslike" | chpasswd || true
+    echo ">> User 'rosadmin' dibuat (password default: roslike)"
+fi
+
+# Aktifkan service
+if [ "$(ps -p 1 -o comm=)" = "systemd" ]; then
+    systemctl daemon-reload || true
+    systemctl enable roslike || true
+    systemctl restart roslike || true
 else
-    update-rc.d roslike-webui defaults || true
-    service roslike-webui restart || true
+    update-rc.d roslike defaults || true
+    service roslike restart || true
 fi
 
 echo ">> RouterOS-like system terpasang."
-echo "   Login SSH sebagai root untuk masuk ke CLI roslike."
 echo "   Akses WebUI: http://<LAN_IP>:8080"
 EOF
 chmod 755 "$WORKDIR/DEBIAN/postinst"
 
-# =========================
-# CLI (roslike)
-# =========================
-cat > "$WORKDIR/usr/bin/roslike" <<'EOF'
-#!/bin/bash
-# CLI ala RouterOS
-echo "RouterOS-like CLI (roslike)"
-while true; do
-    read -e -p "[roslike] > " CMD
-    case "$CMD" in
-        quit|exit) break ;;
-        system\ reboot) echo "Rebooting..."; reboot ;;
-        /interface\ print) ip -o link show ;;
-        /ip\ address\ print) ip -o addr show ;;
-        *) echo "Unknown command: $CMD" ;;
-    esac
-done
-EOF
-chmod 755 "$WORKDIR/usr/bin/roslike"
-
-# =========================
-# WebUI (roslike-webui)
-# =========================
-cat > "$WORKDIR/usr/bin/roslike-webui" <<'EOF'
-#!/usr/bin/env python3
-from flask import Flask
-app = Flask(__name__)
-
-@app.route("/")
-def index():
-    return "<h1>RouterOS-like WebUI</h1><p>Konfigurasi di sini.</p>"
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
-EOF
-chmod 755 "$WORKDIR/usr/bin/roslike-webui"
-
-# =========================
-# systemd service
-# =========================
-cat > "$WORKDIR/etc/systemd/system/roslike-webui.service" <<EOF
+# --- systemd service ---
+cat > "$WORKDIR/lib/systemd/system/roslike.service" <<EOF
 [Unit]
 Description=RouterOS-like WebUI
 After=network.target
@@ -134,15 +98,74 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-# =========================
-# Default shell ke roslike
-# =========================
-chsh -s /usr/bin/roslike root || true
+# --- sysvinit fallback ---
+cat > "$WORKDIR/etc/init.d/roslike" <<'EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides: roslike
+# Required-Start: $network
+# Required-Stop: $network
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: RouterOS-like
+### END INIT INFO
 
-# =========================
-# Build .deb
-# =========================
+case "$1" in
+  start) /usr/bin/roslike-webui & ;;
+  stop) pkill -f roslike-webui ;;
+  restart) pkill -f roslike-webui; /usr/bin/roslike-webui & ;;
+  *) echo "Usage: /etc/init.d/roslike {start|stop|restart}"; exit 1 ;;
+esac
+exit 0
+EOF
+chmod 755 "$WORKDIR/etc/init.d/roslike"
+
+# --- CLI utama ---
+cat > "$WORKDIR/usr/bin/roslike" <<'EOF'
+#!/bin/bash
+# RouterOS-like CLI
+while true; do
+    echo -n "[roslike] > "
+    read cmd args
+    case "$cmd" in
+        quit|exit) exit 0 ;;
+        help) echo "Available commands: ip, user, system, quit" ;;
+        ip) echo "IP configuration (stub)" ;;
+        user) echo "User management (stub)" ;;
+        system) echo "System settings (stub)" ;;
+        *) echo "Unknown command: $cmd" ;;
+    esac
+done
+EOF
+chmod 755 "$WORKDIR/usr/bin/roslike"
+
+# --- WebUI starter ---
+cat > "$WORKDIR/usr/bin/roslike-webui" <<'EOF'
+#!/usr/bin/env python3
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "<h1>RouterOS-like WebUI</h1><p>Semua konfigurasi ada di sini.</p>"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+EOF
+chmod 755 "$WORKDIR/usr/bin/roslike-webui"
+
+# --- Auto CLI untuk root & rosadmin ---
+cat > "$WORKDIR/etc/profile.d/roslike.sh" <<'EOF'
+#!/bin/bash
+if [[ $EUID -eq 0 || $USER == "rosadmin" ]]; then
+    if [[ -x /usr/bin/roslike ]]; then
+        exec /usr/bin/roslike
+    fi
+fi
+EOF
+chmod 755 "$WORKDIR/etc/profile.d/roslike.sh"
+
+# --- Build .deb ---
+echo ">> Membuat paket .deb ..."
 dpkg-deb --build "$WORKDIR"
-mv "${PKGNAME}_${VERSION}.deb" "${PKGNAME}_${VERSION}-1.deb"
-
-echo ">> Build selesai: ${PKGNAME}_${VERSION}-1.deb"
+echo ">> Selesai: $(pwd)/${PKG}_${VER}.deb"
