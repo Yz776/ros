@@ -13,7 +13,6 @@ mkdir -p $MODULE_DIR
 mkdir -p $CONFIG_DIR
 mkdir -p $BUILD_DIR/DEBIAN
 mkdir -p $BUILD_DIR/usr/bin
-mkdir -p $BUILD_DIR/lib/systemd/system
 mkdir -p $BUILD_DIR/etc/init.d
 
 # --- Control file ---
@@ -88,22 +87,7 @@ if __name__=="__main__":
 EOF
 chmod +x $BUILD_DIR/usr/bin/karos-webui
 
-# --- systemd service ---
-cat > $BUILD_DIR/lib/systemd/system/karos.service <<EOF
-[Unit]
-Description=KarOS Router OS WebUI
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/karos-webui
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# --- SysVinit fallback ---
+# --- SysVinit service ---
 cat > $BUILD_DIR/etc/init.d/karos <<'EOF'
 #!/bin/sh
 ### BEGIN INIT INFO
@@ -140,15 +124,9 @@ cat > $BUILD_DIR/DEBIAN/postinst <<'EOF'
 #!/bin/bash
 echo ">> KarOS v1.5 Final Setup"
 
-# Enable systemd or fallback to service
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload
-    systemctl enable karos
-    systemctl restart karos
-else
-    update-rc.d karos defaults
-    service karos restart
-fi
+# Enable init.d service
+update-rc.d karos defaults
+service karos restart
 
 echo ">> Setup selesai. Akses WebUI: http://<LAN_IP>:8080"
 EOF
