@@ -1,14 +1,17 @@
 #!/bin/bash
 
 # Script: build_karos_deb.sh
-# Deskripsi: Script ini membangun paket .deb untuk KarOS v1.5 (Final Production).
+# Deskripsi: Script ini membangun paket .deb untuk KarOS v1.5.2 (Final Production).
 #           - Perbaikan error: shell user karos jadi /usr/bin/karos-cli.
-#           - Fix RTNETLINK: Tambah sudo di CLI untuk perintah ip (karos di sudoers passwordless untuk ip).
-#           - WebUI password sinkron dengan user karos.
-#           - KarOS auto start setelah boot (via update-rc.d).
-#           - Tambah fitur update via CLI (apt upgrade atau deb) dan WebUI (upload deb/apt).
-#           - Kompatibel Debian, robust.
-#           Hasil: karos_1.5-1.deb
+#           - Fix RTNETLINK: Skip konfigurasi jaringan di container tanpa NET_ADMIN.
+#           - Fix WebUI: Perbaiki sintaks Jinja2, tambah pengecekan Flask.
+#           - Fix firewall: Cek privilige iptables.
+#           - Fix DHCP: Cek dnsmasq dan interface.
+#           - Tambah status di /etc/init.d/karos.
+#           - KarOS autostart via update-rc.d.
+#           - Update via CLI (apt/deb) dan WebUI (upload deb/apt).
+#           - Kompatibel Debian/container.
+#           Hasil: karos_1.5.2-1.deb
 
 # Pastikan dependensi build ada
 if ! command -v dpkg-deb &> /dev/null; then
@@ -18,7 +21,7 @@ fi
 
 # Nama paket dan direktori build
 PKG_NAME="karos"
-PKG_VERSION="1.5-1"
+PKG_VERSION="1.5.2-1"
 PKG_DIR="${PKG_NAME}_${PKG_VERSION}"
 
 # Bersihkan direktori lama dan buat struktur baru
@@ -40,7 +43,7 @@ Priority: optional
 Architecture: all
 Depends: python3 (>= 3.9), python3-flask (>= 2.0), iproute2, hostapd, dnsmasq, ppp, pptpd, mariadb-server, iptables, vlan, rsyslog, logrotate, openssh-server, sudo
 Maintainer: KarOS Developer <dev@karos.example>
-Description: KarOS v1.5 - Router OS mirip Mikrotik dengan fitur modular.
+Description: KarOS v1.5.2 - Router OS mirip Mikrotik dengan fitur modular.
  KarOS adalah sistem router berbasis Debian/Ubuntu dengan WebUI dan CLI khusus.
  WebUI dilindungi password, sinkron dengan user karos. Fitur dikonfigurasi via WebUI/CLI.
 EOF
@@ -49,18 +52,28 @@ EOF
 cat << 'EOF' > "$PKG_DIR/DEBIAN/postinst"
 #!/bin/bash
 
-# Post-install script untuk KarOS v1.5
+# Post-install script untuk KarOS v1.5.2
 
 # Fungsi untuk log warning tanpa exit
 log_warning() {
     echo "Warning: $1" >&2
+    echo "Warning: $1" >> /var/log/karos/karos.log
 }
 
 # Fungsi untuk log error fatal
 log_error() {
     echo "Error: $1" >&2
+    echo "Error: $1" >> /var/log/karos/karos.log
     exit 1
 }
+
+# Deteksi apakah di container
+IS_CONTAINER=0
+if grep -q docker /proc/1/cgroup 2>/dev/null || grep -q lxc /proc/1/cgroup 2>/dev/null; then
+    IS_CONTAINER=1
+    log_warning "Sistem terdeteksi sebagai container. Beberapa fitur jaringan mungkin terbatas tanpa --cap-add=NET_ADMIN atau --privileged."
+    echo "Panduan container: Jalankan dengan 'docker run --cap-add=NET_ADMIN --privileged' untuk izin jaringan penuh."
+fi
 
 # Pastikan dependensi terinstall
 for pkg in python3 python3-flask iproute2 hostapd dnsmasq ppp pptpd mariadb-server iptables vlan rsyslog logrotate openssh-server sudo; do
@@ -69,8 +82,15 @@ for pkg in python3 python3-flask iproute2 hostapd dnsmasq ppp pptpd mariadb-serv
     fi
 done
 
+# Pastikan Flask terinstall
+if ! python3 -c "import flask" 2>/dev/null; then
+    log_warning "Flask tidak terdeteksi. Install dengan: sudo pip3 install flask>=2.0"
+fi
+
 # Buat user karos untuk CLI
-if ! id karos >/dev/null 2>&1; then
+if id karos >/dev/null 2>&1; then
+    usermod -s /usr/bin/karos-cli karos || log_warning "Gagal memperbarui shell user karos."
+else
     useradd -m -s /usr/bin/karos-cli karos || log_warning "Gagal membuat user karos."
     echo "karos:karos" | chpasswd || log_warning "Gagal set password karos, default: karos."
 fi
@@ -91,7 +111,11 @@ echo "Setup KarOS: Masukkan password root baru:"
 passwd root || log_warning "Gagal mengubah password root, lanjutkan dengan password saat ini."
 
 # Deteksi interface
-INTERFACES=$(ip link show 2>/dev/null | grep -oP '^\d+: \K\w+(?=:)' | grep -v lo || true)
+if [ "$IS_CONTAINER" -eq 0 ]; then
+    INTERFACES=$(ip link show 2>/dev/null | grep -oP '^\d+: \K\w+(?=:)' | grep -v lo || true)
+else
+    INTERFACES=""
+fi
 LAN_IF="eth0"
 WAN_IF="eth1"
 
@@ -110,7 +134,7 @@ if [ -n "$INTERFACES" ]; then
         log_warning "Interface LAN tidak valid, menggunakan default: $LAN_IF"
     fi
 else
-    log_warning "Tidak ada interface jaringan terdeteksi (mungkin kontainer/VM). Menggunakan default: LAN=$LAN_IF, WAN=$WAN_IF. Konfigurasi manual via /etc/karos/config.json."
+    log_warning "Tidak ada interface jaringan terdeteksi. Menggunakan default: LAN=$LAN_IF, WAN=$WAN_IF. Konfigurasi manual via /etc/karos/config.json."
 fi
 
 # Buat konfigurasi default
@@ -138,26 +162,34 @@ cat << CONFIG > "$CONFIG_FILE"
 CONFIG
 [ $? -eq 0 ] || log_error "Gagal membuat config.json"
 
-# Apply IP default jika interface ada
-if ip link show dev "$LAN_IF" &>/dev/null; then
-    ip addr flush dev "$LAN_IF" 2>/dev/null
-    ip addr add 192.168.88.1/24 dev "$LAN_IF" || log_warning "Gagal set IP LAN"
-    ip link set "$LAN_IF" up || log_warning "Gagal enable interface LAN"
+# Apply IP default jika interface ada dan bukan container
+if [ "$IS_CONTAINER" -eq 0 ]; then
+    if ip link show dev "$LAN_IF" &>/dev/null; then
+        ip addr flush dev "$LAN_IF" 2>/dev/null
+        ip addr add 192.168.88.1/24 dev "$LAN_IF" || log_warning "Gagal set IP LAN"
+        ip link set "$LAN_IF" up || log_warning "Gagal enable interface LAN"
+    else
+        log_warning "Interface $LAN_IF tidak ada, skip setup IP LAN."
+    fi
+    if ip link show dev "$WAN_IF" &>/dev/null; then
+        dhclient "$WAN_IF" >/dev/null 2>&1 || log_warning "Gagal mendapatkan IP WAN via DHCP"
+    else
+        log_warning "Interface $WAN_IF tidak ada, skip setup IP WAN."
+    fi
 else
-    log_warning "Interface $LAN_IF tidak ada, skip setup IP LAN."
+    log_warning "Skip konfigurasi jaringan karena berjalan di container tanpa privilige NET_ADMIN."
 fi
-if ip link show dev "$WAN_IF" &>/dev/null; then
-    dhclient "$WAN_IF" >/dev/null 2>&1 || log_warning "Gagal mendapatkan IP WAN via DHCP"
+
+# Setup firewall jika bukan container
+if [ "$IS_CONTAINER" -eq 0 ] && command -v iptables >/dev/null; then
+    iptables -A INPUT -p tcp --dport 8080 -j ACCEPT 2>/dev/null || log_warning "Gagal set firewall untuk port 8080."
+    iptables-save >/etc/iptables.rules 2>/dev/null || log_warning "Gagal menyimpan aturan firewall."
 else
-    log_warning "Interface $WAN_IF tidak ada, skip setup IP WAN."
+    log_warning "Skip konfigurasi firewall karena berjalan di container atau iptables tidak tersedia."
 fi
 
 # Setup autostart
 update-rc.d karos defaults >/dev/null 2>&1 || log_warning "Gagal mengatur autostart service."
-
-# Pastikan firewall mengizinkan port 8080
-iptables -A INPUT -p tcp --dport 8080 -j ACCEPT 2>/dev/null || log_warning "Gagal set firewall untuk port 8080."
-iptables-save >/etc/iptables.rules 2>/dev/null
 
 # Restart service
 if command -v service >/dev/null; then
@@ -168,7 +200,7 @@ fi
 
 # Verifikasi WebUI berjalan
 LAN_IP="192.168.88.1"
-if ip link show dev "$LAN_IF" &>/dev/null; then
+if [ "$IS_CONTAINER" -eq 0 ] && ip link show dev "$LAN_IF" &>/dev/null; then
     LAN_IP=$(ip addr show "$LAN_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo "192.168.88.1")
 fi
 if netstat -tuln | grep -q ":8080"; then
@@ -177,10 +209,11 @@ else
     log_warning "WebUI tidak terdeteksi di port 8080. Periksa log di /var/log/karos/karos.log."
     echo "Troubleshooting: "
     echo "1. Pastikan service karos berjalan: sudo service karos restart"
-    echo "2. Cek firewall: sudo iptables -L"
+    echo "2. Cek firewall: sudo iptables -L (jika bukan container)"
     echo "3. Cek binding: sudo netstat -tuln | grep 8080"
     echo "4. Periksa log: cat /var/log/karos/karos.log"
     echo "5. Cek Flask: sudo pip3 install flask>=2.0"
+    echo "6. Jika di container, pastikan port mapping: -p 8080:8080 atau --network host"
 fi
 
 # Verifikasi SSH untuk user karos
@@ -263,8 +296,16 @@ case "$1" in
     sleep 1
     $0 start
     ;;
+  status)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "KarOS sedang berjalan (PID: $(cat "$PIDFILE"))."
+    else
+      echo "KarOS tidak berjalan."
+      exit 1
+    fi
+    ;;
   *)
-    echo "Usage: $0 {start|stop|restart}"
+    echo "Usage: $0 {start|stop|restart|status}"
     exit 1
     ;;
 esac
@@ -314,7 +355,7 @@ def apply_feature(feature, config):
 
 class KarOSCLI(cmd.Cmd):
     prompt = '[KarOS] > '
-    intro = 'KarOS v1.5 CLI - Type ? for help'
+    intro = 'KarOS v1.5.2 CLI - Type ? for help'
 
     def do_ip(self, arg):
         """Configure IP: ip set lan <ip> | ip set wan <ip|dhcp> | ip show"""
@@ -333,6 +374,8 @@ class KarOSCLI(cmd.Cmd):
                     subprocess.run(['sudo', 'ip', 'addr', 'flush', 'dev', config['interfaces']['lan']], check=False)
                     subprocess.run(['sudo', 'ip', 'addr', 'add', args[2], 'dev', config['interfaces']['lan']], check=False)
                     subprocess.run(['sudo', 'ip', 'link', 'set', config['interfaces']['lan'], 'up'], check=False)
+                else:
+                    print(f"Interface {config['interfaces']['lan']} tidak ada, skip konfigurasi.")
                 save_config(config)
             elif args[1] == 'wan':
                 config['interfaces']['wan_ip'] = args[2]
@@ -343,6 +386,8 @@ class KarOSCLI(cmd.Cmd):
                         subprocess.run(['sudo', 'ip', 'addr', 'flush', 'dev', config['interfaces']['wan']], check=False)
                         subprocess.run(['sudo', 'ip', 'addr', 'add', args[2], 'dev', config['interfaces']['wan']], check=False)
                         subprocess.run(['sudo', 'ip', 'link', 'set', config['interfaces']['wan'], 'up'], check=False)
+                else:
+                    print(f"Interface {config['interfaces']['wan']} tidak ada, skip konfigurasi.")
                 save_config(config)
             else:
                 print("Usage: ip set lan <ip> | ip set wan <ip|dhcp>")
@@ -423,7 +468,7 @@ if __name__ == '__main__':
 EOF
 chmod 755 "$PKG_DIR/usr/bin/karos-cli"
 
-# Buat /usr/bin/karos-webui dengan autentikasi dan update page
+# Buat /usr/bin/karos-webui dengan sintaks Jinja2 yang diperbaiki
 cat << 'EOF' > "$PKG_DIR/usr/bin/karos-webui"
 #!/usr/bin/env python3
 
@@ -564,7 +609,7 @@ MAIN_TEMPLATE = '''
 </head>
 <body>
     <div id="sidebar">
-        <h2>KarOS v1.5</h2>
+        <h2>KarOS v1.5.2</h2>
         <a href="/">Dashboard</a>
         <a href="/ip">IP / Interfaces</a>
         <a href="/dhcp_server">DHCP Server</a>
@@ -583,7 +628,7 @@ MAIN_TEMPLATE = '''
         <a href="/logout">Logout</a>
     </div>
     <div id="content">
-        {% block content %}{% endblock %}
+        {{ content | safe }}
     </div>
 </body>
 </html>
@@ -633,8 +678,7 @@ def index():
         {% endfor %}
     </table>
     '''
-    template = MAIN_TEMPLATE.replace('{% block content %}{% endblock %}', content)
-    return render_template_string(template, config=config, features=feature_configs.keys())
+    return render_template_string(MAIN_TEMPLATE, content=content, config=config, features=feature_configs.keys())
 
 @app.route('/update', methods=['GET', 'POST'])
 @login_required
@@ -687,8 +731,7 @@ def update_karos():
         {% endif %}
     {% endwith %}
     '''
-    template = MAIN_TEMPLATE.replace('{% block content %}{% endblock %}', content)
-    return render_template_string(template)
+    return render_template_string(MAIN_TEMPLATE, content=content)
 
 @app.route('/ip', methods=['GET', 'POST'])
 @login_required
@@ -724,8 +767,7 @@ def set_ip():
         <button type="submit">Apply</button>
     </form>
     '''
-    template = MAIN_TEMPLATE.replace('{% block content %}{% endblock %}', content)
-    return render_template_string(template, config=config)
+    return render_template_string(MAIN_TEMPLATE, content=content, config=config)
 
 def ip_link_exists(ifname):
     return subprocess.run(['sudo', 'ip', 'link', 'show', 'dev', ifname], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
@@ -763,46 +805,47 @@ def create_feature_route(feature, fields):
             save_config(config)
             apply_feature(feature)
             return redirect(url_for('feature_route'))
-        content = f'''
-        <h1>{feature.replace('_', ' ').upper()}</h1>
+        content = '''
+        <h1>{}</h1>
         <form method="post">
             <div class="form-group">
                 <label>Enabled:</label>
-                <input type="checkbox" name="enabled" {'checked' if config[feature]['enabled'] else ''}>
+                <input type="checkbox" name="enabled" {} >
             </div>
-        '''
+        '''.format(feature.replace('_', ' ').upper(), 'checked' if config[feature]['enabled'] else '')
         for field in fields:
             value = config[feature].get(field, '')
             if isinstance(value, list):
                 value = ','.join(map(str, value))
             if field == 'rules':
-                content += f'''
+                content += '''
                 <div class="form-group">
-                    <label>{field.capitalize()} (one per line):</label>
-                    <textarea name="{field}" rows="5">{value}</textarea>
+                    <label>{} (one per line):</label>
+                    <textarea name="{}" rows="5">{}</textarea>
                 </div>
-                '''
+                '''.format(field.capitalize(), field, value)
             elif field == 'channel':
-                content += f'''
+                content += '''
                 <div class="form-group">
-                    <label>{field.capitalize()}:</label>
-                    <select name="{field}">
-                        {% for i in range(1, 14) %}
-                        <option value="{{ i }}" {{ 'selected' if config[feature]['channel'] == i else '' }}>{{ i }}</option>
-                        {% endfor %}
+                    <label>{}:</label>
+                    <select name="{}">
+                        {} 
                     </select>
                 </div>
-                '''
+                '''.format(
+                    field.capitalize(), 
+                    field, 
+                    ''.join(f'<option value="{i}" {"selected" if config[feature]["channel"] == i else ""}>{i}</option>' for i in range(1, 14))
+                )
             else:
-                content += f'''
+                content += '''
                 <div class="form-group">
-                    <label>{field.capitalize()}:</label>
-                    <input name="{field}" value="{value}">
+                    <label>{}:</label>
+                    <input name="{}" value="{}">
                 </div>
-                '''
+                '''.format(field.capitalize(), field, value)
         content += '<button type="submit">Apply</button></form>'
-        template = MAIN_TEMPLATE.replace('{% block content %}{% endblock %}', content)
-        return render_template_string(template, config=config)
+        return render_template_string(MAIN_TEMPLATE, content=content, config=config)
     return feature_route
 
 for feature, fields in feature_configs.items():
@@ -824,8 +867,7 @@ def logs():
     except subprocess.CalledProcessError:
         logs = "Logs tidak tersedia."
     content = f'<h1>System Logs</h1><pre>{logs}</pre>'
-    template = MAIN_TEMPLATE.replace('{% block content %}{% endblock %}', content)
-    return render_template_string(template)
+    return render_template_string(MAIN_TEMPLATE, content=content)
 
 if __name__ == '__main__':
     try:
@@ -848,8 +890,16 @@ import subprocess
 import os
 
 def enable(config):
+    if not command -v dnsmasq >/dev/null; then
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write("Error: dnsmasq tidak terinstal.\n")
+        raise Exception("dnsmasq tidak terinstal")
     try:
         lan_if = load_global_config()['interfaces']['lan']
+        if subprocess.run(['ip', 'link', 'show', 'dev', lan_if], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            with open('/var/log/karos/karos.log', 'a') as f:
+                f.write(f"Error: Interface {lan_if} tidak ada.\n")
+            raise Exception(f"Interface {lan_if} tidak ada")
         lan_ip = load_global_config()['interfaces']['lan_ip'].split('/')[0]
         conf_path = '/etc/dnsmasq.d/karos-dhcp'
         os.makedirs(os.path.dirname(conf_path), exist_ok=True)
@@ -878,6 +928,9 @@ def disable(config):
 def load_global_config():
     with open('/etc/karos/config.json', 'r') as f:
         return json.load(f)
+
+def command():
+    return subprocess.run(['which', 'dnsmasq'], capture_output=True, text=True).returncode == 0
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
@@ -985,10 +1038,18 @@ import os
 import subprocess
 
 def enable(config):
+    if not command -v hostapd >/dev/null; then
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write("Error: hostapd tidak terinstal.\n")
+        raise Exception("hostapd tidak terinstal")
     try:
+        wlan_if = load_global_config()['interfaces']['lan']
+        if subprocess.run(['ip', 'link', 'show', 'dev', wlan_if], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            with open('/var/log/karos/karos.log', 'a') as f:
+                f.write(f"Error: Interface {wlan_if} tidak ada.\n")
+            raise Exception(f"Interface {wlan_if} tidak ada")
         conf_path = '/etc/hostapd/karos-ap.conf'
         os.makedirs(os.path.dirname(conf_path), exist_ok=True)
-        wlan_if = load_global_config()['interfaces']['lan']
         with open(conf_path, 'w') as f:
             f.write(f"interface={wlan_if}\n")
             f.write("driver=nl80211\n")
@@ -1020,6 +1081,9 @@ def load_global_config():
     with open('/etc/karos/config.json', 'r') as f:
         return json.load(f)
 
+def command():
+    return subprocess.run(['which', 'hostapd'], capture_output=True, text=True).returncode == 0
+
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
         print("Usage: python3 wifi_ap.py [enable|disable] '{json_config}'")
@@ -1041,8 +1105,16 @@ import os
 import subprocess
 
 def enable(config):
+    if not command -v pppoe-server >/dev/null; then
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write("Error: pppoe-server tidak terinstal.\n")
+        raise Exception("pppoe-server tidak terinstal")
     try:
         lan_if = load_global_config()['interfaces']['lan']
+        if subprocess.run(['ip', 'link', 'show', 'dev', lan_if], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            with open('/var/log/karos/karos.log', 'a') as f:
+                f.write(f"Error: Interface {lan_if} tidak ada.\n")
+            raise Exception(f"Interface {lan_if} tidak ada")
         conf_path = '/etc/ppp/pppoe-server-options'
         os.makedirs(os.path.dirname(conf_path), exist_ok=True)
         with open(conf_path, 'w') as f:
@@ -1067,6 +1139,9 @@ def load_global_config():
     with open('/etc/karos/config.json', 'r') as f:
         return json.load(f)
 
+def command():
+    return subprocess.run(['which', 'pppoe-server'], capture_output=True, text=True).returncode == 0
+
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
         print("Usage: python3 pppoe_server.py [enable|disable] '{json_config}'")
@@ -1088,7 +1163,15 @@ import os
 import subprocess
 
 def enable(config):
+    if not command -v pon >/dev/null; then
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write("Error: ppp tidak terinstal.\n")
+        raise Exception("ppp tidak terinstal")
     try:
+        if subprocess.run(['ip', 'link', 'show', 'dev', config['interface']], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            with open('/var/log/karos/karos.log', 'a') as f:
+                f.write(f"Error: Interface {config['interface']} tidak ada.\n")
+            raise Exception(f"Interface {config['interface']} tidak ada")
         peer_path = '/etc/ppp/peers/karos-pppoe'
         os.makedirs(os.path.dirname(peer_path), exist_ok=True)
         with open(peer_path, 'w') as f:
@@ -1116,6 +1199,9 @@ def disable(config):
             f.write(f"Error disabling PPPoE client: {e}\n")
         raise
 
+def command():
+    return subprocess.run(['which', 'pon'], capture_output=True, text=True).returncode == 0
+
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
         print("Usage: python3 pppoe_client.py [enable|disable] '{json_config}'")
@@ -1137,6 +1223,10 @@ import os
 import subprocess
 
 def enable(config):
+    if not command -v pptpd >/dev/null; then
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write("Error: pptpd tidak terinstal.\n")
+        raise Exception("pptpd tidak terinstal")
     try:
         conf_path = '/etc/pptpd.conf'
         os.makedirs(os.path.dirname(conf_path), exist_ok=True)
@@ -1161,6 +1251,9 @@ def disable(config):
             f.write(f"Error disabling PPTP server: {e}\n")
         raise
 
+def command():
+    return subprocess.run(['which', 'pptpd'], capture_output=True, text=True).returncode == 0
+
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
         print("Usage: python3 pptp_server.py [enable|disable] '{json_config}'")
@@ -1182,6 +1275,10 @@ import os
 import subprocess
 
 def enable(config):
+    if not command -v pon >/dev/null; then
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write("Error: ppp tidak terinstal.\n")
+        raise Exception("ppp tidak terinstal")
     try:
         peer_path = '/etc/ppp/peers/karos-pptp'
         os.makedirs(os.path.dirname(peer_path), exist_ok=True)
@@ -1211,6 +1308,9 @@ def disable(config):
             f.write(f"Error disabling PPTP client: {e}\n")
         raise
 
+def command():
+    return subprocess.run(['which', 'pon'], capture_output=True, text=True).returncode == 0
+
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
         print("Usage: python3 pptp_client.py [enable|disable] '{json_config}'")
@@ -1231,6 +1331,10 @@ import json
 import subprocess
 
 def enable(config):
+    if not command -v iptables >/dev/null; then
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write("Error: iptables tidak terinstal.\n")
+        raise Exception("iptables tidak terinstal")
     try:
         subprocess.run(['sudo', 'iptables', '-F'], check=True)
         subprocess.run(['sudo', 'iptables', '-A', 'INPUT', '-i', 'lo', '-j', 'ACCEPT'], check=True)
@@ -1257,6 +1361,9 @@ def disable(config):
             f.write(f"Error disabling firewall: {e}\n")
         raise
 
+def command():
+    return subprocess.run(['which', 'iptables'], capture_output=True, text=True).returncode == 0
+
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
         print("Usage: python3 firewall.py [enable|disable] '{json_config}'")
@@ -1277,6 +1384,10 @@ import json
 import subprocess
 
 def enable(config):
+    if not command -v rsyslogd >/dev/null; then
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write("Error: rsyslog tidak terinstal.\n")
+        raise Exception("rsyslog tidak terinstal")
     try:
         conf_path = '/etc/rsyslog.d/karos.conf'
         with open(conf_path, 'w') as f:
@@ -1297,6 +1408,9 @@ def disable(config):
         with open('/var/log/karos/karos.log', 'a') as f:
             f.write(f"Error disabling logging: {e}\n")
         raise
+
+def command():
+    return subprocess.run(['which', 'rsyslogd'], capture_output=True, text=True).returncode == 0
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
