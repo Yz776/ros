@@ -3,10 +3,10 @@
 # Script: build_karos_deb.sh
 # Deskripsi: Script ini membangun paket .deb untuk KarOS v1.5 (Final Production).
 #           - Perbaikan error: shell user karos jadi /usr/bin/karos-cli.
-#           - Fix RTNETLINK: Tambah sudo di CLI untuk perintah ip (asumsikan karos di sudoers passwordless untuk ip).
+#           - Fix RTNETLINK: Tambah sudo di CLI untuk perintah ip (karos di sudoers passwordless untuk ip).
 #           - WebUI password sinkron dengan user karos.
-#           - KarOS auto start setelah boot (sudah via update-rc.d).
-#           - Tambah fitur update via CLI (apt upgrade) dan WebUI (button untuk apt upgrade).
+#           - KarOS auto start setelah boot (via update-rc.d).
+#           - Tambah fitur update via CLI (apt upgrade atau deb) dan WebUI (upload deb/apt).
 #           - Kompatibel Debian, robust.
 #           Hasil: karos_1.5-1.deb
 
@@ -65,7 +65,7 @@ log_error() {
 # Pastikan dependensi terinstall
 for pkg in python3 python3-flask iproute2 hostapd dnsmasq ppp pptpd mariadb-server iptables vlan rsyslog logrotate openssh-server sudo; do
     if ! dpkg -l | grep -qw "$pkg"; then
-        log_warning "$pkg tidak terdeteksi. Pastikan terinstall dengan: sudo apt install $pkg"
+        log_warning "$pkg tidak terdeteksi. Install dengan: sudo apt install $pkg"
     fi
 done
 
@@ -75,10 +75,10 @@ if ! id karos >/dev/null 2>&1; then
     echo "karos:karos" | chpasswd || log_warning "Gagal set password karos, default: karos."
 fi
 
-# Beri karos sudo privilege passwordless untuk ip commands
+# Beri karos sudo privilege passwordless untuk ip dan dhclient
 SUDOERS_FILE="/etc/sudoers.d/karos"
 echo "karos ALL=(ALL) NOPASSWD: /sbin/ip, /sbin/dhclient" > "$SUDOERS_FILE"
-chmod 0440 "$SUDOERS_FILE"
+chmod 0440 "$SUDOERS_FILE" || log_warning "Gagal set sudoers untuk karos."
 
 # Simpan password karos untuk WebUI (hash SHA-256)
 PASSWD_FILE="/etc/karos/karos.passwd"
@@ -155,6 +155,10 @@ fi
 # Setup autostart
 update-rc.d karos defaults >/dev/null 2>&1 || log_warning "Gagal mengatur autostart service."
 
+# Pastikan firewall mengizinkan port 8080
+iptables -A INPUT -p tcp --dport 8080 -j ACCEPT 2>/dev/null || log_warning "Gagal set firewall untuk port 8080."
+iptables-save >/etc/iptables.rules 2>/dev/null
+
 # Restart service
 if command -v service >/dev/null; then
     service karos restart >/dev/null 2>&1 || log_warning "Gagal restart service karos."
@@ -176,6 +180,7 @@ else
     echo "2. Cek firewall: sudo iptables -L"
     echo "3. Cek binding: sudo netstat -tuln | grep 8080"
     echo "4. Periksa log: cat /var/log/karos/karos.log"
+    echo "5. Cek Flask: sudo pip3 install flask>=2.0"
 fi
 
 # Verifikasi SSH untuk user karos
@@ -303,7 +308,7 @@ def apply_feature(feature, config):
     if os.path.exists(module_path):
         action = 'enable' if config[feature]['enabled'] else 'disable'
         try:
-            subprocess.run(['python3', module_path, action, json.dumps(config[feature])], check=True)
+            subprocess.run(['sudo', 'python3', module_path, action, json.dumps(config[feature])], check=True)
         except subprocess.CalledProcessError as e:
             print(f"Error applying {feature}: {e}")
 
@@ -376,7 +381,7 @@ class KarOSCLI(cmd.Cmd):
             print("Usage: passwd <new_password>")
             return
         try:
-            subprocess.run(['karos-passwd', arg], check=True)
+            subprocess.run(['sudo', 'karos-passwd', arg], check=True)
             print("Password updated successfully.")
         except subprocess.CalledProcessError:
             print("Error updating password.")
@@ -386,14 +391,16 @@ class KarOSCLI(cmd.Cmd):
         if arg:
             try:
                 subprocess.run(['sudo', 'dpkg', '-i', arg], check=True)
-                print("KarOS updated from deb file.")
+                subprocess.run(['sudo', 'service', 'karos', 'restart'], check=True)
+                print("KarOS updated from deb file and service restarted.")
             except subprocess.CalledProcessError as e:
                 print(f"Error updating from deb: {e}")
         else:
             try:
                 subprocess.run(['sudo', 'apt', 'update'], check=True)
                 subprocess.run(['sudo', 'apt', 'upgrade', '-y', 'karos'], check=True)
-                print("KarOS updated via apt.")
+                subprocess.run(['sudo', 'service', 'karos', 'restart'], check=True)
+                print("KarOS updated via apt and service restarted.")
             except subprocess.CalledProcessError as e:
                 print(f"Error updating via apt: {e}")
 
@@ -423,7 +430,7 @@ cat << 'EOF' > "$PKG_DIR/usr/bin/karos-webui"
 import json
 import os
 import subprocess
-from flask import Flask, request, render_template_string, redirect, url_for, session, flash, send_file
+from flask import Flask, request, render_template_string, redirect, url_for, session, flash
 import hashlib
 from werkzeug.utils import secure_filename
 
@@ -478,7 +485,7 @@ def apply_feature(feature):
     if os.path.exists(module_path):
         action = 'enable' if enabled else 'disable'
         try:
-            subprocess.run(['python3', module_path, action, json.dumps(config[feature])], check=True)
+            subprocess.run(['sudo', 'python3', module_path, action, json.dumps(config[feature])], check=True)
         except subprocess.CalledProcessError as e:
             with open(LOG_PATH, 'a') as f:
                 f.write(f"Error applying {feature}: {e}\n")
@@ -644,7 +651,8 @@ def update_karos():
                 file.save(file_path)
                 try:
                     subprocess.run(['sudo', 'dpkg', '-i', file_path], check=True)
-                    flash('KarOS updated successfully from deb file.')
+                    subprocess.run(['sudo', 'service', 'karos', 'restart'], check=True)
+                    flash('KarOS updated successfully from deb file and service restarted.')
                 except subprocess.CalledProcessError as e:
                     flash(f'Error updating from deb: {e}')
                 finally:
@@ -654,7 +662,8 @@ def update_karos():
             try:
                 subprocess.run(['sudo', 'apt', 'update'], check=True)
                 subprocess.run(['sudo', 'apt', 'upgrade', '-y', 'karos'], check=True)
-                flash('KarOS updated successfully via apt.')
+                subprocess.run(['sudo', 'service', 'karos', 'restart'], check=True)
+                flash('KarOS updated successfully via apt and service restarted.')
             except subprocess.CalledProcessError as e:
                 flash(f'Error updating via apt: {e}')
             return redirect(url_for('update_karos'))
@@ -668,6 +677,15 @@ def update_karos():
         <button type="submit">Update</button>
     </form>
     <p>Jika tidak upload deb, akan jalankan apt upgrade karos.</p>
+    {% with messages = get_flashed_messages() %}
+        {% if messages %}
+            <ul>
+            {% for message in messages %}
+                <li>{{ message }}</li>
+            {% endfor %}
+            </ul>
+        {% endif %}
+    {% endwith %}
     '''
     template = MAIN_TEMPLATE.replace('{% block content %}{% endblock %}', content)
     return render_template_string(template)
@@ -819,8 +837,482 @@ if __name__ == '__main__':
 EOF
 chmod 755 "$PKG_DIR/usr/bin/karos-webui"
 
-# Modul-modul (sama seperti sebelumnya, dengan logging)
-# ... (copy from previous, assuming same, with sudo if needed for ip in modules, but since modules run as root via service, ok)
+# Buat modul-modul
+# dhcp_server.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/dhcp_server.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import subprocess
+import os
+
+def enable(config):
+    try:
+        lan_if = load_global_config()['interfaces']['lan']
+        lan_ip = load_global_config()['interfaces']['lan_ip'].split('/')[0]
+        conf_path = '/etc/dnsmasq.d/karos-dhcp'
+        os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+        with open(conf_path, 'w') as f:
+            f.write(f"interface={lan_if}\n")
+            f.write(f"dhcp-range={config['range']}\n")
+            f.write(f"dhcp-option=option:router,{lan_ip}\n")
+            f.write("dhcp-option=option:dns-server,8.8.8.8,8.8.4.4\n")
+        subprocess.run(['sudo', 'service', 'dnsmasq', 'restart'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling DHCP server: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        subprocess.run(['sudo', 'service', 'dnsmasq', 'stop'], check=True)
+        conf_path = '/etc/dnsmasq.d/karos-dhcp'
+        if os.path.exists(conf_path):
+            os.remove(conf_path)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling DHCP server: {e}\n")
+        raise
+
+def load_global_config():
+    with open('/etc/karos/config.json', 'r') as f:
+        return json.load(f)
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 dhcp_server.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# dns_client.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/dns_client.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import os
+
+def enable(config):
+    try:
+        with open('/etc/resolv.conf', 'w') as f:
+            for server in config['servers']:
+                if server:
+                    f.write(f"nameserver {server}\n")
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling DNS client: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        with open('/etc/resolv.conf', 'w') as f:
+            f.write("nameserver 127.0.0.1\n")
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling DNS client: {e}\n")
+        raise
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 dns_client.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# vlan_support.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/vlan_support.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import subprocess
+
+def enable(config):
+    try:
+        lan_if = load_global_config()['interfaces']['lan']
+        for vlan_id in config['vlans']:
+            if vlan_id.isdigit():
+                subprocess.run(['sudo', 'ip', 'link', 'add', 'link', lan_if, 'name', f'{lan_if}.{vlan_id}', 'type', 'vlan', 'id', vlan_id], check=True)
+                subprocess.run(['sudo', 'ip', 'link', 'set', f'{lan_if}.{vlan_id}', 'up'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling VLAN: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        lan_if = load_global_config()['interfaces']['lan']
+        for vlan_id in config['vlans']:
+            if vlan_id.isdigit():
+                subprocess.run(['sudo', 'ip', 'link', 'delete', f'{lan_if}.{vlan_id}'], check=False)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling VLAN: {e}\n")
+        raise
+
+def load_global_config():
+    with open('/etc/karos/config.json', 'r') as f:
+        return json.load(f)
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 vlan_support.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# wifi_ap.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/wifi_ap.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import os
+import subprocess
+
+def enable(config):
+    try:
+        conf_path = '/etc/hostapd/karos-ap.conf'
+        os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+        wlan_if = load_global_config()['interfaces']['lan']
+        with open(conf_path, 'w') as f:
+            f.write(f"interface={wlan_if}\n")
+            f.write("driver=nl80211\n")
+            f.write(f"ssid={config['ssid']}\n")
+            f.write("hw_mode=g\n")
+            f.write(f"channel={config['channel']}\n")
+            f.write("wpa=2\n")
+            f.write(f"wpa_passphrase={config['passphrase']}\n")
+            f.write("wpa_key_mgmt=WPA-PSK\n")
+            f.write("rsn_pairwise=CCMP\n")
+        subprocess.run(['sudo', 'service', 'hostapd', 'restart'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling WiFi AP: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        subprocess.run(['sudo', 'service', 'hostapd', 'stop'], check=True)
+        conf_path = '/etc/hostapd/karos-ap.conf'
+        if os.path.exists(conf_path):
+            os.remove(conf_path)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling WiFi AP: {e}\n")
+        raise
+
+def load_global_config():
+    with open('/etc/karos/config.json', 'r') as f:
+        return json.load(f)
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 wifi_ap.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# pppoe_server.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/pppoe_server.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import os
+import subprocess
+
+def enable(config):
+    try:
+        lan_if = load_global_config()['interfaces']['lan']
+        conf_path = '/etc/ppp/pppoe-server-options'
+        os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+        with open(conf_path, 'w') as f:
+            f.write("require-pap\n")
+            f.write("ms-dns 8.8.8.8\n")
+            f.write("ms-dns 8.8.4.4\n")
+        subprocess.run(['sudo', 'pppoe-server', '-I', lan_if, '-L', config['local_ip'], '-R', config['remote_ip'], '-F'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling PPPoE server: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        subprocess.run(['sudo', 'killall', 'pppoe-server'], check=False)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling PPPoE server: {e}\n")
+        raise
+
+def load_global_config():
+    with open('/etc/karos/config.json', 'r') as f:
+        return json.load(f)
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 pppoe_server.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# pppoe_client.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/pppoe_client.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import os
+import subprocess
+
+def enable(config):
+    try:
+        peer_path = '/etc/ppp/peers/karos-pppoe'
+        os.makedirs(os.path.dirname(peer_path), exist_ok=True)
+        with open(peer_path, 'w') as f:
+            f.write(f"plugin rp-pppoe.so\n")
+            f.write(f"nic-{config['interface']}\n")
+            f.write(f"user \"{config['username']}\"\n")
+            f.write("usepeerdns\n")
+        chap_path = '/etc/ppp/chap-secrets'
+        with open(chap_path, 'a') as f:
+            f.write(f"\"{config['username']}\" * \"{config['password']}\" *\n")
+        subprocess.run(['sudo', 'pon', 'karos-pppoe'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling PPPoE client: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        subprocess.run(['sudo', 'poff', 'karos-pppoe'], check=False)
+        peer_path = '/etc/ppp/peers/karos-pppoe'
+        if os.path.exists(peer_path):
+            os.remove(peer_path)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling PPPoE client: {e}\n")
+        raise
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 pppoe_client.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# pptp_server.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/pptp_server.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import os
+import subprocess
+
+def enable(config):
+    try:
+        conf_path = '/etc/pptpd.conf'
+        os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+        with open(conf_path, 'w') as f:
+            f.write(f"localip {config['local_ip']}\n")
+            f.write(f"remoteip {config['remote_ip']}\n")
+        options_path = '/etc/ppp/pptpd-options'
+        with open(options_path, 'w') as f:
+            f.write("ms-dns 8.8.8.8\n")
+            f.write("ms-dns 8.8.4.4\n")
+        subprocess.run(['sudo', 'service', 'pptpd', 'restart'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling PPTP server: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        subprocess.run(['sudo', 'service', 'pptpd', 'stop'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling PPTP server: {e}\n")
+        raise
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 pptp_server.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# pptp_client.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/pptp_client.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import os
+import subprocess
+
+def enable(config):
+    try:
+        peer_path = '/etc/ppp/peers/karos-pptp'
+        os.makedirs(os.path.dirname(peer_path), exist_ok=True)
+        with open(peer_path, 'w') as f:
+            f.write(f"pty \"pptp {config['server']} --nolaunchpppd\"\n")
+            f.write(f"name {config['username']}\n")
+            f.write("remotename PPTP\n")
+            f.write("require-mppe-128\n")
+            f.write("file /etc/ppp/options.pptp\n")
+        chap_path = '/etc/ppp/chap-secrets'
+        with open(chap_path, 'a') as f:
+            f.write(f"{config['username']} PPTP \"{config['password']}\" *\n")
+        subprocess.run(['sudo', 'pon', 'karos-pptp'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling PPTP client: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        subprocess.run(['sudo', 'poff', 'karos-pptp'], check=False)
+        peer_path = '/etc/ppp/peers/karos-pptp'
+        if os.path.exists(peer_path):
+            os.remove(peer_path)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling PPTP client: {e}\n")
+        raise
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 pptp_client.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# firewall.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/firewall.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import subprocess
+
+def enable(config):
+    try:
+        subprocess.run(['sudo', 'iptables', '-F'], check=True)
+        subprocess.run(['sudo', 'iptables', '-A', 'INPUT', '-i', 'lo', '-j', 'ACCEPT'], check=True)
+        subprocess.run(['sudo', 'iptables', '-A', 'INPUT', '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'], check=True)
+        subprocess.run(['sudo', 'iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', '8080', '-j', 'ACCEPT'], check=True)
+        subprocess.run(['sudo', 'iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', '22', '-j', 'ACCEPT'], check=True)
+        for rule in config.get('rules', []):
+            if rule:
+                subprocess.run(['sudo', 'iptables'] + rule.split(), check=True)
+        subprocess.run(['sudo', 'iptables', '-A', 'INPUT', '-j', 'DROP'], check=True)
+        subprocess.run(['sudo', 'iptables-save'], stdout=open('/etc/iptables.rules', 'w'), check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling firewall: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        subprocess.run(['sudo', 'iptables', '-F'], check=True)
+        if os.path.exists('/etc/iptables.rules'):
+            os.remove('/etc/iptables.rules')
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling firewall: {e}\n")
+        raise
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 firewall.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# logging.py
+cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/logging.py"
+#!/usr/bin/env python3
+
+import sys
+import json
+import subprocess
+
+def enable(config):
+    try:
+        conf_path = '/etc/rsyslog.d/karos.conf'
+        with open(conf_path, 'w') as f:
+            f.write(f"*.* /var/log/karos/karos.log\n")
+        subprocess.run(['sudo', 'service', 'rsyslog', 'restart'], check=True)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling logging: {e}\n")
+        raise
+
+def disable(config):
+    try:
+        subprocess.run(['sudo', 'service', 'rsyslog', 'stop'], check=True)
+        conf_path = '/etc/rsyslog.d/karos.conf'
+        if os.path.exists(conf_path):
+            os.remove(conf_path)
+    except Exception as e:
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling logging: {e}\n")
+        raise
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
+        print("Usage: python3 logging.py [enable|disable] '{json_config}'")
+        sys.exit(1)
+    config = json.loads(sys.argv[2])
+    if sys.argv[1] == 'enable':
+        enable(config)
+    else:
+        disable(config)
+EOF
+
+# Set permission untuk semua modul
+for file in "$PKG_DIR/usr/lib/karos/modules/"*; do
+    chmod 755 "$file"
+done
 
 # Build paket
 dpkg-deb --build "$PKG_DIR"
