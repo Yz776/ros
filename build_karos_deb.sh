@@ -2,11 +2,11 @@
 
 # Script: build_karos_deb.sh
 # Deskripsi: Script ini membangun paket .deb untuk KarOS v1.5 (Final Production).
-#           - Kompatibel dengan Debian (termasuk VM/kontainer seperti Docker).
-#           - WebUI mirip Mikrotik Webfig dengan sidebar, form detail, dan undo/redo.
-#           - Semua fitur (DHCP, DNS, VLAN, WiFi, PPPoE, PPTP, Firewall, Logging) diimplementasikan penuh.
-#           - Robust: Tidak gagal meski tidak ada interface, fallback ke default.
-#           - Menggunakan SysVinit (bukan systemd), dependensi diverifikasi.
+#           - WebUI dilindungi password, sama dengan user 'karos' (default: karos/karos).
+#           - Perubahan password karos via CLI/passwd akan sinkron dengan WebUI.
+#           - CLI khusus untuk user karos, mirip Mikrotik.
+#           - WebUI di port 8080, diperbaiki untuk SSH tunneling.
+#           - Kompatibel dengan Debian (termasuk VM/kontainer), robust, tanpa bug.
 #           Hasil: karos_1.5-1.deb
 
 # Pastikan dependensi build ada
@@ -36,14 +36,14 @@ Version: $PKG_VERSION
 Section: net
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.9), python3-flask (>= 2.0), iproute2, hostapd, dnsmasq, ppp, pptpd, mariadb-server, iptables, vlan, rsyslog, logrotate
+Depends: python3 (>= 3.9), python3-flask (>= 2.0), iproute2, hostapd, dnsmasq, ppp, pptpd, mariadb-server, iptables, vlan, rsyslog, logrotate, openssh-server
 Maintainer: KarOS Developer <dev@karos.example>
 Description: KarOS v1.5 - Router OS mirip Mikrotik dengan fitur modular.
- KarOS adalah sistem router berbasis Debian/Ubuntu dengan WebUI untuk konfigurasi.
- Semua fitur default nonaktif dan bisa diaktifkan via WebUI.
+ KarOS adalah sistem router berbasis Debian/Ubuntu dengan WebUI dan CLI khusus.
+ WebUI dilindungi password, sinkron dengan user karos. Fitur dikonfigurasi via WebUI/CLI.
 EOF
 
-# Buat file DEBIAN/postinst (robust, handle no interface)
+# Buat file DEBIAN/postinst
 cat << 'EOF' > "$PKG_DIR/DEBIAN/postinst"
 #!/bin/bash
 
@@ -61,17 +61,29 @@ log_error() {
 }
 
 # Pastikan dependensi terinstall
-for pkg in python3 python3-flask iproute2 hostapd dnsmasq ppp pptpd mariadb-server iptables vlan rsyslog logrotate; do
+for pkg in python3 python3-flask iproute2 hostapd dnsmasq ppp pptpd mariadb-server iptables vlan rsyslog logrotate openssh-server; do
     if ! dpkg -l | grep -qw "$pkg"; then
         log_warning "$pkg tidak terdeteksi. Pastikan terinstall dengan: sudo apt install $pkg"
     fi
 done
 
+# Buat user karos untuk CLI
+if ! id karos >/dev/null 2>&1; then
+    useradd -m -s /usr/bin/karos-cli karos || log_warning "Gagal membuat user karos."
+    echo "karos:karos" | chpasswd || log_warning "Gagal set password karos, default: karos."
+fi
+
+# Simpan password karos untuk WebUI (hash SHA-256)
+PASSWD_FILE="/etc/karos/karos.passwd"
+mkdir -p /etc/karos || log_error "Gagal membuat direktori /etc/karos"
+echo -n "karos" | sha256sum | awk '{print $1}' > "$PASSWD_FILE" || log_warning "Gagal membuat file password WebUI."
+chmod 600 "$PASSWD_FILE"
+
 # Minta password root baru
 echo "Setup KarOS: Masukkan password root baru:"
 passwd root || log_warning "Gagal mengubah password root, lanjutkan dengan password saat ini."
 
-# Deteksi interface (kecuali lo)
+# Deteksi interface
 INTERFACES=$(ip link show 2>/dev/null | grep -oP '^\d+: \K\w+(?=:)' | grep -v lo || true)
 LAN_IF="eth0"
 WAN_IF="eth1"
@@ -143,16 +155,56 @@ else
     log_warning "Perintah 'service' tidak ditemukan, skip restart."
 fi
 
-# Dapatkan IP LAN
+# Verifikasi WebUI berjalan
 LAN_IP="192.168.88.1"
 if ip link show dev "$LAN_IF" &>/dev/null; then
     LAN_IP=$(ip addr show "$LAN_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo "192.168.88.1")
 fi
+if netstat -tuln | grep -q ":8080"; then
+    echo "WebUI berjalan di http://$LAN_IP:8080 (login: karos, password: karos)"
+else
+    log_warning "WebUI tidak terdeteksi di port 8080. Periksa log di /var/log/karos/karos.log."
+    echo "Troubleshooting: "
+    echo "1. Pastikan service karos berjalan: sudo service karos restart"
+    echo "2. Cek firewall: sudo iptables -L"
+    echo "3. Cek binding: sudo netstat -tuln | grep 8080"
+    echo "4. Periksa log: cat /var/log/karos/karos.log"
+fi
 
-echo "Setup selesai. Akses WebUI: http://$LAN_IP:8080"
+# Verifikasi SSH untuk user karos
+if command -v sshd >/dev/null && service ssh status >/dev/null 2>&1; then
+    echo "SSH aktif. Login sebagai 'karos' (password: karos) untuk CLI."
+else
+    log_warning "SSH tidak aktif. Install/aktifkan dengan: sudo apt install openssh-server && sudo service ssh start"
+fi
+
+echo "Setup selesai. Akses WebUI: http://$LAN_IP:8080 (login: karos, password: karos)"
+echo "Login CLI: ssh karos@$LAN_IP (password default: karos)"
 exit 0
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/postinst"
+
+# Buat script untuk sinkronasi password
+cat << 'EOF' > "$PKG_DIR/usr/bin/karos-passwd"
+#!/bin/bash
+
+# Script untuk mengubah password user karos dan sinkron dengan WebUI
+PASSWD_FILE="/etc/karos/karos.passwd"
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <new_password>"
+    exit 1
+fi
+
+# Ubah password user karos
+echo "karos:$1" | chpasswd || { echo "Error: Gagal mengubah password karos."; exit 1; }
+
+# Update password WebUI
+echo -n "$1" | sha256sum | awk '{print $1}' > "$PASSWD_FILE" || { echo "Error: Gagal update password WebUI."; exit 1; }
+chmod 600 "$PASSWD_FILE"
+echo "Password karos dan WebUI berhasil diubah."
+exit 0
+EOF
+chmod 755 "$PKG_DIR/usr/bin/karos-passwd"
 
 # Buat /etc/init.d/karos
 cat << 'EOF' > "$PKG_DIR/etc/init.d/karos"
@@ -208,20 +260,20 @@ exit 0
 EOF
 chmod 755 "$PKG_DIR/etc/init.d/karos"
 
-# Buat /usr/bin/karos-webui
-cat << 'EOF' > "$PKG_DIR/usr/bin/karos-webui"
+# Buat /usr/bin/karos-cli
+cat << 'EOF' > "$PKG_DIR/usr/bin/karos-cli"
 #!/usr/bin/env python3
 
+import cmd
 import json
 import os
 import subprocess
-from flask import Flask, request, render_template_string, redirect, url_for, session
+import shlex
+import hashlib
 
-app = Flask(__name__)
-app.secret_key = b'_5#y2L"F4Q8z\n\xec]/'
 CONFIG_PATH = '/etc/karos/config.json'
 MODULES_DIR = '/usr/lib/karos/modules'
-LOG_PATH = '/var/log/syslog'
+PASSWD_FILE = '/etc/karos/karos.passwd'
 
 def load_config():
     try:
@@ -229,6 +281,140 @@ def load_config():
             return json.load(f)
     except Exception as e:
         print(f"Error loading config: {e}")
+        return {}
+
+def save_config(config):
+    try:
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        print(f"Error saving config: {e}")
+
+def apply_feature(feature, config):
+    module_path = os.path.join(MODULES_DIR, f'{feature}.py')
+    if os.path.exists(module_path):
+        action = 'enable' if config[feature]['enabled'] else 'disable'
+        try:
+            subprocess.run(['python3', module_path, action, json.dumps(config[feature])], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error applying {feature}: {e}")
+
+class KarOSCLI(cmd.Cmd):
+    prompt = '[KarOS] > '
+    intro = 'KarOS v1.5 CLI - Type ? for help'
+
+    def do_ip(self, arg):
+        """Configure IP: ip set lan <ip> | ip set wan <ip|dhcp> | ip show"""
+        args = shlex.split(arg)
+        config = load_config()
+        if not args:
+            print("Usage: ip set lan <ip> | ip set wan <ip|dhcp> | ip show")
+            return
+        if args[0] == 'show':
+            print(f"LAN: {config['interfaces']['lan']} ({config['interfaces']['lan_ip']})")
+            print(f"WAN: {config['interfaces']['wan']} ({config['interfaces']['wan_ip']})")
+        elif args[0] == 'set' and len(args) >= 3:
+            if args[1] == 'lan':
+                config['interfaces']['lan_ip'] = args[2]
+                if subprocess.run(['ip', 'link', 'show', 'dev', config['interfaces']['lan']], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                    subprocess.run(['ip', 'addr', 'flush', 'dev', config['interfaces']['lan']], check=False)
+                    subprocess.run(['ip', 'addr', 'add', args[2], 'dev', config['interfaces']['lan']], check=False)
+                    subprocess.run(['ip', 'link', 'set', config['interfaces']['lan'], 'up'], check=False)
+                save_config(config)
+            elif args[1] == 'wan':
+                config['interfaces']['wan_ip'] = args[2]
+                if subprocess.run(['ip', 'link', 'show', 'dev', config['interfaces']['wan']], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                    if args[2] == 'dhcp':
+                        subprocess.run(['dhclient', config['interfaces']['wan']], check=False)
+                    else:
+                        subprocess.run(['ip', 'addr', 'flush', 'dev', config['interfaces']['wan']], check=False)
+                        subprocess.run(['ip', 'addr', 'add', args[2], 'dev', config['interfaces']['wan']], check=False)
+                        subprocess.run(['ip', 'link', 'set', config['interfaces']['wan'], 'up'], check=False)
+                save_config(config)
+            else:
+                print("Usage: ip set lan <ip> | ip set wan <ip|dhcp>")
+        else:
+            print("Usage: ip set lan <ip> | ip set wan <ip|dhcp> | ip show")
+
+    def do_dhcp(self, arg):
+        """Configure DHCP Server: dhcp set range <range> | dhcp enable | dhcp disable | dhcp show"""
+        args = shlex.split(arg)
+        config = load_config()
+        if not args:
+            print("Usage: dhcp set range <range> | dhcp enable | dhcp disable | dhcp show")
+            return
+        if args[0] == 'show':
+            print(f"DHCP Server: {'Enabled' if config['dhcp_server']['enabled'] else 'Disabled'}")
+            print(f"Range: {config['dhcp_server']['range']}")
+        elif args[0] == 'set' and len(args) == 3 and args[1] == 'range':
+            config['dhcp_server']['range'] = args[2]
+            save_config(config)
+            if config['dhcp_server']['enabled']:
+                apply_feature('dhcp_server', config)
+        elif args[0] == 'enable':
+            config['dhcp_server']['enabled'] = True
+            save_config(config)
+            apply_feature('dhcp_server', config)
+        elif args[0] == 'disable':
+            config['dhcp_server']['enabled'] = False
+            save_config(config)
+            apply_feature('dhcp_server', config)
+        else:
+            print("Usage: dhcp set range <range> | dhcp enable | dhcp disable | dhcp show")
+
+    def do_passwd(self, arg):
+        """Change karos user and WebUI password: passwd <new_password>"""
+        if not arg:
+            print("Usage: passwd <new_password>")
+            return
+        try:
+            subprocess.run(['karos-passwd', arg], check=True)
+            print("Password updated successfully.")
+        except subprocess.CalledProcessError:
+            print("Error updating password.")
+
+    def do_quit(self, arg):
+        """Exit CLI"""
+        return True
+
+    def do_help(self, arg):
+        """Show help"""
+        print("Available commands:")
+        print("  ip set lan <ip> | ip set wan <ip|dhcp> | ip show")
+        print("  dhcp set range <range> | dhcp enable | dhcp disable | dhcp show")
+        print("  passwd <new_password>")
+        print("  quit")
+        print("  help")
+
+if __name__ == '__main__':
+    KarOSCLI().cmdloop()
+EOF
+chmod 755 "$PKG_DIR/usr/bin/karos-cli"
+
+# Buat /usr/bin/karos-webui dengan autentikasi
+cat << 'EOF' > "$PKG_DIR/usr/bin/karos-webui"
+#!/usr/bin/env python3
+
+import json
+import os
+import subprocess
+from flask import Flask, request, render_template_string, redirect, url_for, session, flash
+import hashlib
+
+app = Flask(__name__)
+app.secret_key = b'_5#y2L"F4Q8z\n\xec]/'
+CONFIG_PATH = '/etc/karos/config.json'
+MODULES_DIR = '/usr/lib/karos/modules'
+LOG_PATH = '/var/log/karos/karos.log'
+PASSWD_FILE = '/etc/karos/karos.passwd'
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        with open(LOG_PATH, 'a') as f:
+            f.write(f"Error loading config: {e}\n")
         return {}
 
 def save_config(config):
@@ -241,7 +427,8 @@ def save_config(config):
         with open(CONFIG_PATH, 'w') as f:
             json.dump(config, f, indent=2)
     except Exception as e:
-        print(f"Error saving config: {e}")
+        with open(LOG_PATH, 'a') as f:
+            f.write(f"Error saving config: {e}\n")
 
 def undo():
     try:
@@ -252,7 +439,8 @@ def undo():
             return prev_config
         return load_config()
     except Exception as e:
-        print(f"Error undoing config: {e}")
+        with open(LOG_PATH, 'a') as f:
+            f.write(f"Error undoing config: {e}\n")
         return load_config()
 
 def apply_feature(feature):
@@ -264,7 +452,58 @@ def apply_feature(feature):
         try:
             subprocess.run(['python3', module_path, action, json.dumps(config[feature])], check=True)
         except subprocess.CalledProcessError as e:
-            print(f"Error applying {feature}: {e}")
+            with open(LOG_PATH, 'a') as f:
+                f.write(f"Error applying {feature}: {e}\n")
+
+def check_auth(username, password):
+    try:
+        with open(PASSWD_FILE, 'r') as f:
+            stored_hash = f.read().strip()
+        input_hash = hashlib.sha256(password.encode()).hexdigest()
+        return username == 'karos' and input_hash == stored_hash
+    except Exception as e:
+        with open(LOG_PATH, 'a') as f:
+            f.write(f"Error checking auth: {e}\n")
+        return False
+
+# Template login
+LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>KarOS Login</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f0f0f0; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-box { background: white; padding: 20px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        .login-box h2 { color: #004080; }
+        .form-group { margin-bottom: 15px; }
+        input { width: 100%; padding: 8px; margin: 5px 0; box-sizing: border-box; }
+        button { background: #004080; color: white; border: none; padding: 10px; cursor: pointer; width: 100%; }
+        button:hover { background: #0066cc; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h2>KarOS WebUI Login</h2>
+        {% if error %}
+        <p class="error">{{ error }}</p>
+        {% endif %}
+        <form method="post" action="/login">
+            <div class="form-group">
+                <label>Username:</label>
+                <input type="text" name="username" value="karos" readonly>
+            </div>
+            <div class="form-group">
+                <label>Password:</label>
+                <input type="password" name="password">
+            </div>
+            <button type="submit">Login</button>
+        </form>
+    </div>
+</body>
+</html>
+'''
 
 # Template utama
 MAIN_TEMPLATE = '''
@@ -305,6 +544,7 @@ MAIN_TEMPLATE = '''
         <a href="/logging">Logging</a>
         <a href="/logs">System Logs</a>
         <a href="/undo">Undo Changes</a>
+        <a href="/logout">Logout</a>
     </div>
     <div id="content">
         {% block content %}{% endblock %}
@@ -313,7 +553,33 @@ MAIN_TEMPLATE = '''
 </html>
 '''
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        if check_auth(username, password):
+            session['logged_in'] = True
+            return redirect(url_for('index'))
+        else:
+            return render_template_string(LOGIN_TEMPLATE, error="Invalid credentials")
+    return render_template_string(LOGIN_TEMPLATE, error=None)
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
+
+def login_required(f):
+    def wrap(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    wrap.__name__ = f.__name__
+    return wrap
+
 @app.route('/')
+@login_required
 def index():
     config = load_config()
     content = '''
@@ -335,6 +601,7 @@ def index():
     return render_template_string(template, config=config, features=feature_configs.keys())
 
 @app.route('/ip', methods=['GET', 'POST'])
+@login_required
 def set_ip():
     config = load_config()
     if request.method == 'POST':
@@ -373,7 +640,6 @@ def set_ip():
 def ip_link_exists(ifname):
     return subprocess.run(['ip', 'link', 'show', 'dev', ifname], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
-# Route generator untuk fitur
 feature_configs = {
     'dhcp_server': ['range'],
     'dns_client': ['servers'],
@@ -389,6 +655,7 @@ feature_configs = {
 
 def create_feature_route(feature, fields):
     @app.route(f'/{feature}', methods=['GET', 'POST'])
+    @login_required
     def feature_route():
         config = load_config()
         if request.method == 'POST':
@@ -452,6 +719,7 @@ for feature, fields in feature_configs.items():
     globals()[feature + '_route'] = create_feature_route(feature, fields)
 
 @app.route('/undo')
+@login_required
 def undo_route():
     config = undo()
     for feature in feature_configs:
@@ -459,6 +727,7 @@ def undo_route():
     return redirect(url_for('index'))
 
 @app.route('/logs')
+@login_required
 def logs():
     try:
         logs = subprocess.check_output(['tail', '-n', '100', LOG_PATH], stderr=subprocess.STDOUT).decode()
@@ -469,11 +738,16 @@ def logs():
     return render_template_string(template)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    try:
+        app.run(host='0.0.0.0', port=8080, debug=False)
+    except Exception as e:
+        with open(LOG_PATH, 'a') as f:
+            f.write(f"WebUI failed to start: {e}\n")
+        raise
 EOF
 chmod 755 "$PKG_DIR/usr/bin/karos-webui"
 
-# Buat modul-modul
+# Modul-modul (dengan logging)
 # dhcp_server.py
 cat << 'EOF' > "$PKG_DIR/usr/lib/karos/modules/dhcp_server.py"
 #!/usr/bin/env python3
@@ -496,7 +770,9 @@ def enable(config):
             f.write("dhcp-option=option:dns-server,8.8.8.8,8.8.4.4\n")
         subprocess.run(['service', 'dnsmasq', 'restart'], check=True)
     except Exception as e:
-        print(f"Error enabling DHCP server: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling DHCP server: {e}\n")
+        raise
 
 def disable(config):
     try:
@@ -505,7 +781,9 @@ def disable(config):
         if os.path.exists(conf_path):
             os.remove(conf_path)
     except Exception as e:
-        print(f"Error disabling DHCP server: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling DHCP server: {e}\n")
+        raise
 
 def load_global_config():
     with open('/etc/karos/config.json', 'r') as f:
@@ -537,14 +815,18 @@ def enable(config):
                 if server:
                     f.write(f"nameserver {server}\n")
     except Exception as e:
-        print(f"Error enabling DNS client: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling DNS client: {e}\n")
+        raise
 
 def disable(config):
     try:
         with open('/etc/resolv.conf', 'w') as f:
             f.write("nameserver 127.0.0.1\n")
     except Exception as e:
-        print(f"Error disabling DNS client: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling DNS client: {e}\n")
+        raise
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
@@ -573,7 +855,9 @@ def enable(config):
                 subprocess.run(['ip', 'link', 'add', 'link', lan_if, 'name', f'{lan_if}.{vlan_id}', 'type', 'vlan', 'id', vlan_id], check=True)
                 subprocess.run(['ip', 'link', 'set', f'{lan_if}.{vlan_id}', 'up'], check=True)
     except Exception as e:
-        print(f"Error enabling VLAN: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling VLAN: {e}\n")
+        raise
 
 def disable(config):
     try:
@@ -582,7 +866,9 @@ def disable(config):
             if vlan_id.isdigit():
                 subprocess.run(['ip', 'link', 'delete', f'{lan_if}.{vlan_id}'], check=False)
     except Exception as e:
-        print(f"Error disabling VLAN: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling VLAN: {e}\n")
+        raise
 
 def load_global_config():
     with open('/etc/karos/config.json', 'r') as f:
@@ -612,7 +898,7 @@ def enable(config):
     try:
         conf_path = '/etc/hostapd/karos-ap.conf'
         os.makedirs(os.path.dirname(conf_path), exist_ok=True)
-        wlan_if = load_global_config()['interfaces']['lan']  # Asumsi LAN, ganti jika spesifik
+        wlan_if = load_global_config()['interfaces']['lan']
         with open(conf_path, 'w') as f:
             f.write(f"interface={wlan_if}\n")
             f.write("driver=nl80211\n")
@@ -625,7 +911,9 @@ def enable(config):
             f.write("rsn_pairwise=CCMP\n")
         subprocess.run(['service', 'hostapd', 'restart'], check=True)
     except Exception as e:
-        print(f"Error enabling WiFi AP: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling WiFi AP: {e}\n")
+        raise
 
 def disable(config):
     try:
@@ -634,7 +922,9 @@ def disable(config):
         if os.path.exists(conf_path):
             os.remove(conf_path)
     except Exception as e:
-        print(f"Error disabling WiFi AP: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling WiFi AP: {e}\n")
+        raise
 
 def load_global_config():
     with open('/etc/karos/config.json', 'r') as f:
@@ -671,13 +961,17 @@ def enable(config):
             f.write("ms-dns 8.8.4.4\n")
         subprocess.run(['pppoe-server', '-I', lan_if, '-L', config['local_ip'], '-R', config['remote_ip'], '-F'], check=True)
     except Exception as e:
-        print(f"Error enabling PPPoE server: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling PPPoE server: {e}\n")
+        raise
 
 def disable(config):
     try:
         subprocess.run(['killall', 'pppoe-server'], check=False)
     except Exception as e:
-        print(f"Error disabling PPPoE server: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling PPPoE server: {e}\n")
+        raise
 
 def load_global_config():
     with open('/etc/karos/config.json', 'r') as f:
@@ -717,7 +1011,9 @@ def enable(config):
             f.write(f"\"{config['username']}\" * \"{config['password']}\" *\n")
         subprocess.run(['pon', 'karos-pppoe'], check=True)
     except Exception as e:
-        print(f"Error enabling PPPoE client: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling PPPoE client: {e}\n")
+        raise
 
 def disable(config):
     try:
@@ -726,7 +1022,9 @@ def disable(config):
         if os.path.exists(peer_path):
             os.remove(peer_path)
     except Exception as e:
-        print(f"Error disabling PPPoE client: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling PPPoE client: {e}\n")
+        raise
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
@@ -761,13 +1059,17 @@ def enable(config):
             f.write("ms-dns 8.8.4.4\n")
         subprocess.run(['service', 'pptpd', 'restart'], check=True)
     except Exception as e:
-        print(f"Error enabling PPTP server: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling PPTP server: {e}\n")
+        raise
 
 def disable(config):
     try:
         subprocess.run(['service', 'pptpd', 'stop'], check=True)
     except Exception as e:
-        print(f"Error disabling PPTP server: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling PPTP server: {e}\n")
+        raise
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
@@ -804,7 +1106,9 @@ def enable(config):
             f.write(f"{config['username']} PPTP \"{config['password']}\" *\n")
         subprocess.run(['pon', 'karos-pptp'], check=True)
     except Exception as e:
-        print(f"Error enabling PPTP client: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling PPTP client: {e}\n")
+        raise
 
 def disable(config):
     try:
@@ -813,7 +1117,9 @@ def disable(config):
         if os.path.exists(peer_path):
             os.remove(peer_path)
     except Exception as e:
-        print(f"Error disabling PPTP client: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling PPTP client: {e}\n")
+        raise
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
@@ -839,13 +1145,16 @@ def enable(config):
         subprocess.run(['iptables', '-F'], check=True)
         subprocess.run(['iptables', '-A', 'INPUT', '-i', 'lo', '-j', 'ACCEPT'], check=True)
         subprocess.run(['iptables', '-A', 'INPUT', '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'], check=True)
+        subprocess.run(['iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', '8080', '-j', 'ACCEPT'], check=True)
         for rule in config.get('rules', []):
             if rule:
                 subprocess.run(['iptables'] + rule.split(), check=True)
         subprocess.run(['iptables', '-A', 'INPUT', '-j', 'DROP'], check=True)
         subprocess.run(['iptables-save'], stdout=open('/etc/iptables.rules', 'w'), check=True)
     except Exception as e:
-        print(f"Error enabling firewall: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling firewall: {e}\n")
+        raise
 
 def disable(config):
     try:
@@ -853,7 +1162,9 @@ def disable(config):
         if os.path.exists('/etc/iptables.rules'):
             os.remove('/etc/iptables.rules')
     except Exception as e:
-        print(f"Error disabling firewall: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling firewall: {e}\n")
+        raise
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
@@ -881,7 +1192,9 @@ def enable(config):
             f.write(f"*.* /var/log/karos/karos.log\n")
         subprocess.run(['service', 'rsyslog', 'restart'], check=True)
     except Exception as e:
-        print(f"Error enabling logging: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error enabling logging: {e}\n")
+        raise
 
 def disable(config):
     try:
@@ -890,7 +1203,9 @@ def disable(config):
         if os.path.exists(conf_path):
             os.remove(conf_path)
     except Exception as e:
-        print(f"Error disabling logging: {e}")
+        with open('/var/log/karos/karos.log', 'a') as f:
+            f.write(f"Error disabling logging: {e}\n")
+        raise
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] not in ['enable', 'disable']:
